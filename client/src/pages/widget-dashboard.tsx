@@ -1,8 +1,12 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { CheckSquare, FileText, Search, Activity, Settings } from "lucide-react";
+import { LayoutDashboard, CheckSquare, FileText, Search, Activity, Settings } from "lucide-react";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { ConnectionBanner } from "@/components/widget/connection-banner";
+import { StatsDashboard } from "@/components/widget/stats-dashboard";
+import { TaskFilters, type TaskFilter, type TaskSort } from "@/components/widget/task-filters";
+import { QuickActions } from "@/components/widget/quick-actions";
 import { TaskCard } from "@/components/widget/task-card";
 import { DocumentItem } from "@/components/widget/document-item";
 import { SearchInterface } from "@/components/widget/search-interface";
@@ -16,8 +20,17 @@ import type { NotionTask, NotionDocument, SearchResult, ActivityItem } from "@sh
 
 export default function WidgetDashboard() {
   const { toast } = useToast();
-  const [activeTab, setActiveTab] = useState("tasks");
+  const [activeTab, setActiveTab] = useState("overview");
   const [searchQuery, setSearchQuery] = useState("");
+  const [taskFilters, setTaskFilters] = useState<TaskFilter>({
+    search: "",
+    status: "all",
+    assignee: "all",
+  });
+  const [taskSort, setTaskSort] = useState<TaskSort>({
+    field: "dueDate",
+    direction: "asc",
+  });
 
   // Check connection status
   const { data: connectionStatus, isLoading: isLoadingConnection } = useQuery<{
@@ -121,18 +134,59 @@ export default function WidgetDashboard() {
     }
   };
 
+  const filteredAndSortedTasks = useMemo(() => {
+    let filtered = tasks;
+
+    if (taskFilters.search) {
+      filtered = filtered.filter(task =>
+        task.title.toLowerCase().includes(taskFilters.search.toLowerCase())
+      );
+    }
+
+    if (taskFilters.status !== "all") {
+      filtered = filtered.filter(task => task.status === taskFilters.status);
+    }
+
+    const sorted = [...filtered].sort((a, b) => {
+      const direction = taskSort.direction === "asc" ? 1 : -1;
+      
+      switch (taskSort.field) {
+        case "title":
+          return direction * a.title.localeCompare(b.title);
+        case "status":
+          return direction * a.status.localeCompare(b.status);
+        case "dueDate":
+          if (!a.dueDate && !b.dueDate) return 0;
+          if (!a.dueDate) return 1;
+          if (!b.dueDate) return -1;
+          return direction * (new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime());
+        case "assignee":
+          const aAssignee = a.assignee || "";
+          const bAssignee = b.assignee || "";
+          return direction * aAssignee.localeCompare(bAssignee);
+        default:
+          return 0;
+      }
+    });
+
+    return sorted;
+  }, [tasks, taskFilters, taskSort]);
+
   const isConnected = connectionStatus?.isConnected ?? false;
 
   return (
     <div className="min-h-screen bg-background p-6" data-testid="page-widget-dashboard">
       <div className="max-w-3xl mx-auto">
-        <div className="mb-6">
-          <h1 className="text-lg font-semibold text-foreground mb-1">
-            Notion for Cliq
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Manage your Notion workspace from Zoho Cliq
-          </p>
+        <div className="mb-6 flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-lg font-semibold text-foreground mb-1">
+              Notion for Cliq
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              Manage your Notion workspace from Zoho Cliq
+            </p>
+          </div>
+          <ThemeToggle />
         </div>
 
         {!isLoadingConnection && !isConnected && (
@@ -142,7 +196,11 @@ export default function WidgetDashboard() {
         )}
 
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-          <TabsList className="w-full grid grid-cols-5 mb-6" data-testid="tabs-navigation">
+          <TabsList className="w-full grid grid-cols-3 sm:grid-cols-6 mb-6" data-testid="tabs-navigation">
+            <TabsTrigger value="overview" className="gap-2" data-testid="tab-overview">
+              <LayoutDashboard className="h-4 w-4" />
+              <span className="hidden sm:inline">Overview</span>
+            </TabsTrigger>
             <TabsTrigger value="tasks" className="gap-2" data-testid="tab-tasks">
               <CheckSquare className="h-4 w-4" />
               <span className="hidden sm:inline">Tasks</span>
@@ -165,6 +223,24 @@ export default function WidgetDashboard() {
             </TabsTrigger>
           </TabsList>
 
+          <TabsContent value="overview" className="mt-0">
+            {!isConnected ? (
+              <EmptyState
+                icon={LayoutDashboard}
+                title="Connect Notion to view your dashboard"
+                description="Connect your Notion account to see insights, stats, and productivity metrics"
+                actionLabel="Connect Notion"
+                onAction={handleConnect}
+              />
+            ) : (
+              <StatsDashboard 
+                tasks={tasks} 
+                activities={activities}
+                isLoading={isLoadingTasks || isLoadingActivity}
+              />
+            )}
+          </TabsContent>
+
           <TabsContent value="tasks" className="mt-0">
             {!isConnected ? (
               <EmptyState
@@ -183,16 +259,30 @@ export default function WidgetDashboard() {
                 description="Create tasks in Notion or use the /notion command in Cliq"
               />
             ) : (
-              <div className="space-y-3" data-testid="list-tasks">
-                {tasks.map((task) => (
-                  <TaskCard
-                    key={task.id}
-                    {...task}
-                    onStatusChange={(id, checked) => 
-                      updateTaskStatus.mutate({ id, completed: checked })
-                    }
+              <div className="space-y-4">
+                <TaskFilters
+                  onFilterChange={setTaskFilters}
+                  onSortChange={setTaskSort}
+                />
+                {filteredAndSortedTasks.length === 0 ? (
+                  <EmptyState
+                    icon={CheckSquare}
+                    title="No tasks match your filters"
+                    description="Try adjusting your filters to see more tasks"
                   />
-                ))}
+                ) : (
+                  <div className="space-y-3" data-testid="list-tasks">
+                    {filteredAndSortedTasks.map((task) => (
+                      <TaskCard
+                        key={task.id}
+                        {...task}
+                        onStatusChange={(id, checked) => 
+                          updateTaskStatus.mutate({ id, completed: checked })
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </TabsContent>
@@ -280,6 +370,19 @@ export default function WidgetDashboard() {
           </TabsContent>
         </Tabs>
       </div>
+
+      {isConnected && (
+        <QuickActions
+          onTaskCreated={() => {
+            queryClient.invalidateQueries({ queryKey: ['/api/tasks'] });
+            queryClient.invalidateQueries({ queryKey: ['/api/activity'] });
+          }}
+          onNoteCreated={() => {
+            queryClient.invalidateQueries({ queryKey: ['/api/docs'] });
+            queryClient.invalidateQueries({ queryKey: ['/api/activity'] });
+          }}
+        />
+      )}
     </div>
   );
 }

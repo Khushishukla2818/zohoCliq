@@ -145,6 +145,47 @@ export async function updatePage(notion: Client, pageId: string, properties: any
   return response;
 }
 
+// Create a simple page - requires user's Notion client
+export async function createPage(notion: Client, params: {
+  title: string;
+  content?: string;
+  parentPageId?: string;
+}) {
+  const pageData: any = {
+    properties: {
+      title: {
+        title: [{ text: { content: params.title } }]
+      }
+    },
+  };
+
+  if (params.content) {
+    pageData.children = [
+      {
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [{ text: { content: params.content } }]
+        }
+      }
+    ];
+  }
+
+  if (params.parentPageId) {
+    pageData.parent = { page_id: params.parentPageId };
+  } else {
+    // Create in default workspace
+    pageData.parent = { type: 'workspace', workspace: true };
+  }
+
+  const response = await notion.pages.create(pageData);
+
+  return {
+    id: response.id,
+    url: response.url,
+  };
+}
+
 // Create a page from text - requires user's Notion client
 export async function createPageFromText(notion: Client, params: {
   title: string;

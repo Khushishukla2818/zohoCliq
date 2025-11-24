@@ -231,6 +231,45 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Create new task
+  app.post("/api/tasks", async (req: Request, res: Response) => {
+    try {
+      const user = await getOrCreateCliqUser(req);
+      const userToken = await storage.getNotionToken(user.id);
+      const { title, status = "To Do" } = req.body;
+      
+      if (!title) {
+        return res.status(400).json({ error: "Title is required" });
+      }
+      
+      if (!userToken) {
+        return res.status(400).json({ error: "Notion not connected" });
+      }
+      
+      const notion = await notionService.getNotionClient(userToken);
+      const page = await notionService.createPage(notion, { title });
+      
+      await storage.createActivityLog({
+        cliqUserId: user.id,
+        activityType: 'task_created',
+        description: `Created task: ${title}`,
+        notionPageId: page.id,
+        notionPageTitle: title,
+        notionPageUrl: page.url,
+      });
+      
+      res.json({
+        id: page.id,
+        title,
+        status,
+        url: page.url,
+      });
+    } catch (error: any) {
+      console.error('Error creating task:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Update task status
   app.patch("/api/tasks/:id", async (req: Request, res: Response) => {
     try {
@@ -272,6 +311,44 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json(docs);
     } catch (error: any) {
       console.error('Error fetching docs:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Create new note/page
+  app.post("/api/notes", async (req: Request, res: Response) => {
+    try {
+      const user = await getOrCreateCliqUser(req);
+      const userToken = await storage.getNotionToken(user.id);
+      const { title, content = "" } = req.body;
+      
+      if (!title) {
+        return res.status(400).json({ error: "Title is required" });
+      }
+      
+      if (!userToken) {
+        return res.status(400).json({ error: "Notion not connected" });
+      }
+      
+      const notion = await notionService.getNotionClient(userToken);
+      const page = await notionService.createPage(notion, { title, content });
+      
+      await storage.createActivityLog({
+        cliqUserId: user.id,
+        activityType: 'doc_created',
+        description: `Created note: ${title}`,
+        notionPageId: page.id,
+        notionPageTitle: title,
+        notionPageUrl: page.url,
+      });
+      
+      res.json({
+        id: page.id,
+        title,
+        url: page.url,
+      });
+    } catch (error: any) {
+      console.error('Error creating note:', error);
       res.status(500).json({ error: error.message });
     }
   });
