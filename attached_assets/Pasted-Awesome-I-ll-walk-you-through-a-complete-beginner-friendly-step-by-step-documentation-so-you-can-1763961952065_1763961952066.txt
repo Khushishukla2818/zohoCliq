@@ -1,0 +1,695 @@
+Awesome — I’ll walk you through a complete, beginner-friendly, step-by-step documentation so you can build the **Notion ⇄ Zoho Cliq** integration from zero. I’ll assume no prior knowledge and give concrete commands, file/layout examples, API flow diagrams, and checklists so you can follow along and get a working MVP.
+
+I’ll structure this as:
+
+1. Quick overview & what you’ll learn
+2. Prerequisites (accounts, tools, basics)
+3. Project plan & milestones
+4. Registering apps (Notion + Zoho Cliq)
+5. Repo & local setup (Node.js + Express example)
+6. Database & data model
+7. OAuth with Notion (detailed flow & code)
+8. Slash command (`/notion task add`) — request/response flow + code
+9. Message action (“Save to Notion”) — frontend + backend
+10. Widget (embedded dashboard) — sample HTML/JS
+11. Notion webhooks & notifications → Cliq
+12. Scheduled reminders (cron job)
+13. Security, logging, and production concerns
+14. Testing & QA checklist
+15. Deployment (simple options)
+16. Demo checklist & judge pitch
+17. Troubleshooting & FAQ
+18. Next steps & feature roadmap
+19. Handy resources & final checklist
+
+---
+
+# 1 — Quick overview & what you’ll learn
+
+By the end of this doc you will have:
+
+* Registered a Notion integration and a Cliq app.
+* Built a Node.js backend (Express) that handles Notion OAuth, creates pages/tasks in Notion, handles slash commands and message actions from Cliq.
+* Implemented a small widget (HTML/JS) embedded in Cliq that shows "My Tasks".
+* Implemented Notion webhooks to notify Cliq when a relevant Notion page changes.
+* Implemented scheduled reminders for due dates.
+
+This guide uses **Node.js + Express** for the backend (easy to follow). If you prefer Python (FastAPI) later I can convert.
+
+---
+
+# 2 — Prerequisites (what you need)
+
+Accounts
+
+* Notion account (preferably a workspace where you can create an integration).
+* Zoho Cliq account with permission to create apps (a test workspace).
+* GitHub account (optional but recommended).
+
+Local tools
+
+* Node.js (v18+ recommended). Install from nodejs.org.
+* npm (comes with Node).
+* Git.
+* PostgreSQL (recommended) or SQLite for PoC.
+* ngrok (or localtunnel) for exposing local server to the internet during development (required for OAuth redirect & Cliq webhooks).
+* VS Code or another code editor.
+
+Basic knowledge helpful (but not required)
+
+* Familiarity with terminal basics and editing files.
+* Basic JavaScript/Node.js.
+
+---
+
+# 3 — Project plan & milestones (timeline)
+
+* Milestone 1 (Day 1): Repo skeleton, register Notion & Cliq apps, backend OAuth flow working.
+* Milestone 2 (Day 2): Slash command `/notion task add` working end-to-end.
+* Milestone 3 (Day 3): Message action “Save to Notion” implemented + widget skeleton.
+* Milestone 4 (Day 4): Notion webhook handling + reminders.
+* Milestone 5 (Day 5): Polish UI, deploy to cloud, prepare demo video.
+
+You can do a simple PoC in a day (Milestones 1–2).
+
+---
+
+# 4 — Registering apps
+
+## Notion — create an integration
+
+1. Go to Notion Developers → Create new integration.
+2. Give a name (e.g., `Cliq Notion Bridge`), redirect URI (you’ll use `https://<your-ngrok>.ngrok.io/auth/notion/callback` for local dev).
+3. Note the **Client ID** and **Client Secret** (store in `.env`).
+4. For MVP, your integration needs permission to read/write pages and databases. (When building, check current Notion OAuth scopes in their docs; name may vary.)
+
+## Notion — prepare a task database
+
+Create a database in Notion for tasks (call it `Cliq Tasks`). Note the database id (from Notion database URL or via API). Columns you might have:
+
+* Name (title)
+* Status (select)
+* Due (date)
+* Assignee (people)
+* CliqLink (rich_text)
+
+> Tip: For a PoC you can create pages directly without a DB; but using a database allows properties.
+
+## Zoho Cliq — create an app
+
+1. Go to Zoho Cliq Developer Console → Create new app.
+2. Add features:
+
+   * Slash command: `/notion` (configure endpoint to your server).
+   * Message action: Add a "Save to Notion" action (configure endpoint).
+   * Widget: point to an embeddable URL hosted by your server.
+3. You'll get credentials (if needed) or at least an app manifest. Note the verification token or secret for request validation.
+
+**Important:** Cliq will POST to your endpoints. For local development use ngrok and set the public ngrok URL in Cliq app configuration.
+
+---
+
+# 5 — Repo & local setup (Node.js + Express example)
+
+## Create project skeleton
+
+Run:
+
+```bash
+mkdir notion-cliq-integration
+cd notion-cliq-integration
+git init
+npm init -y
+npm install express axios dotenv body-parser pg sequelize knex jsonwebtoken node-cron
+npm install --save-dev nodemon
+```
+
+(We use `axios` for HTTP, `pg` + any ORM for DB, `node-cron` for scheduled jobs.)
+
+## Suggested folder layout
+
+```
+notion-cliq-integration/
+├─ server/
+│  ├─ src/
+│  │  ├─ index.js
+│  │  ├─ routes/
+│  │  │  ├─ auth.js
+│  │  │  ├─ cliq.js
+│  │  │  └─ notionWebhook.js
+│  │  ├─ services/
+│  │  │  ├─ notionService.js
+│  │  │  └─ cliqService.js
+│  │  ├─ models/
+│  │  └─ utils/
+│  └─ package.json
+├─ cliq-widget/
+│  └─ index.html
+├─ .env
+└─ README.md
+```
+
+## Example `package.json` scripts
+
+```json
+"scripts": {
+  "start": "node src/index.js",
+  "dev": "nodemon src/index.js"
+}
+```
+
+---
+
+# 6 — Database & data model
+
+For PoC you can use SQLite or a JSON file; recommended is PostgreSQL for real use.
+
+SQL schema (Postgres):
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  cliq_user_id VARCHAR UNIQUE,
+  cliq_display_name VARCHAR,
+  notion_user_id VARCHAR,
+  connected_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE notion_tokens (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id),
+  access_token TEXT,
+  refresh_token TEXT,
+  expires_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE mappings (
+  id SERIAL PRIMARY KEY,
+  cliq_message_id VARCHAR,
+  notion_page_id VARCHAR,
+  cliq_channel_id VARCHAR,
+  created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE notification_settings (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id),
+  reminders_on BOOLEAN DEFAULT true,
+  reminder_hours_before INTEGER DEFAULT 24
+);
+```
+
+---
+
+# 7 — OAuth with Notion — flow & detailed code
+
+## OAuth flow summary
+
+1. User clicks "Connect Notion" in your Cliq widget (or triggers `/notion connect`).
+2. Backend creates Notion OAuth authorize URL and redirects the user.
+3. User approves. Notion redirects to your `/auth/notion/callback?code=...`.
+4. Backend exchanges `code` for `access_token` + `refresh_token`.
+5. Store tokens in DB associated with the Cliq user.
+
+## Sample authorize URL
+
+```
+https://api.notion.com/v1/oauth/authorize?
+  owner=user
+  &client_id=YOUR_CLIENT_ID
+  &redirect_uri=https://<your-domain>/auth/notion/callback
+  &response_type=code
+```
+
+## Exchange code for token (POST)
+
+Endpoint: `https://api.notion.com/v1/oauth/token`
+Body (JSON):
+
+```json
+{
+  "grant_type": "authorization_code",
+  "code": "<AUTHORIZATION_CODE>",
+  "redirect_uri": "https://<your-domain>/auth/notion/callback",
+  "client_id": "<YOUR_CLIENT_ID>",
+  "client_secret": "<YOUR_CLIENT_SECRET>"
+}
+```
+
+Notion returns `access_token`, `bot_id`, `workspace`, and possibly `owner` info. Save `access_token` and `refresh_token` with expiry.
+
+## Example Express route skeleton (`src/routes/auth.js`)
+
+```js
+const express = require('express');
+const axios = require('axios');
+const router = express.Router();
+
+router.get('/notion/start', (req, res) => {
+  const redirectUri = process.env.NOTION_REDIRECT_URI;
+  const clientId = process.env.NOTION_CLIENT_ID;
+  const url = `https://api.notion.com/v1/oauth/authorize?owner=user&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code`;
+  res.redirect(url);
+});
+
+router.get('/notion/callback', async (req, res) => {
+  const code = req.query.code;
+  const tokenResp = await axios.post('https://api.notion.com/v1/oauth/token', {
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: process.env.NOTION_REDIRECT_URI,
+    client_id: process.env.NOTION_CLIENT_ID,
+    client_secret: process.env.NOTION_CLIENT_SECRET
+  });
+  // tokenResp.data.access_token, tokenResp.data.bot_id etc.
+  // TODO: associate token with current cliq user (you may pass state param earlier to identify).
+  res.send('Notion connected! You can close this window.');
+});
+
+module.exports = router;
+```
+
+### Important notes
+
+* Use `state` parameter in the authorize URL to tie the OAuth flow to a specific Cliq user (to prevent CSRF and know which user to store the token for).
+* Save tokens encrypted at rest (or at least in a secure store).
+* Implement token refresh logic.
+
+---
+
+# 8 — Slash command `/notion task add` — flow & code
+
+## User flow
+
+* User types in Cliq: `/notion task add Prepare slides --due 2025-12-01 --assignee @bob`
+* Cliq sends a POST to your configured slash command endpoint with a payload including `user_id`, `command`, `text`, `channel_id`, etc.
+* Your backend parses text, looks up the caller's Notion tokens, creates a Notion page in the task DB, maps properties, and replies to Cliq with a confirmation message and link.
+
+## Parse command example (simple)
+
+* Command syntax: `/notion task add <title> [--due yyyy-mm-dd] [--assignee @username]`
+  Write a simple parser that extracts `title`, `due`.
+
+## Example server route (`src/routes/cliq.js`)
+
+```js
+const express = require('express');
+const router = express.Router();
+const notionService = require('../services/notionService');
+
+router.post('/cliq/slash', async (req, res) => {
+  const { user_id, text } = req.body; // check Cliq payload
+  // parse `text` to get action: here 'task add ...'
+  const [action, subAction, ...rest] = text.split(' ');
+  if (action === 'task' && subAction === 'add') {
+    const restText = rest.join(' ');
+    // parse restText for title/due
+    const title = restText.replace(/--due\s+\d{4}-\d{2}-\d{2}/, '').trim();
+    const dueMatch = restText.match(/--due\s+(\d{4}-\d{2}-\d{2})/);
+    const due = dueMatch ? dueMatch[1] : null;
+    // find tokens for user_id from DB
+    const token = await getNotionTokenForCliqUser(user_id);
+    if (!token) {
+      return res.json({ text: 'Please connect your Notion account first via /notion connect' });
+    }
+    const page = await notionService.createTaskPage(token.access_token, {
+      title, due, createdFrom: `Cliq:${user_id}`
+    });
+    // save mapping and respond
+    res.json({ text: `Task created: ${page.url}` });
+  } else {
+    res.json({ text: 'Unknown command. Use `/notion task add <title> --due yyyy-mm-dd`' });
+  }
+});
+
+module.exports = router;
+```
+
+## Sample `notionService.createTaskPage()` (using Notion API)
+
+```js
+const axios = require('axios');
+
+async function createTaskPage(accessToken, { title, due, createdFrom }) {
+  const body = {
+    parent: { database_id: process.env.NOTION_TASK_DB_ID },
+    properties: {
+      Name: { title: [{ text: { content: title } }] },
+      Status: { select: { name: 'To Do' } }
+    }
+  };
+  if (due) body.properties.Due = { date: { start: due } };
+  body.properties.CliqLink = { rich_text: [{ text: { content: createdFrom } }] };
+
+  const resp = await axios.post('https://api.notion.com/v1/pages', body, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Notion-Version': '2022-06-28',
+      'Content-Type': 'application/json'
+    }
+  });
+  // resp.data will contain page id; you can construct URL from it or request the page.
+  return resp.data;
+}
+```
+
+> Note: Use the latest Notion-Version header supported; check docs.
+
+---
+
+# 9 — Message action: “Save to Notion”
+
+## UX flow
+
+1. User right-clicks a message in Cliq and selects “Save to Notion”.
+2. Cliq calls your message-action webhook with payload including message text, message_id, channel_id, user info.
+3. Your server receives it, optionally opens a modal in Cliq (or replies) to let user choose:
+
+   * Save as Task vs Document
+   * Choose Database (Tasks, Docs)
+   * Add tags, due date
+4. Backend creates a Notion page and replies with confirmation (or a card with link).
+
+## Implementing the message action
+
+* Cliq supports message actions that POST to your app.
+* In your app settings specify the endpoint (e.g., `/cliq/message-action`).
+
+## Example endpoint skeleton
+
+```js
+router.post('/cliq/message-action', async (req, res) => {
+  const { message, user } = req.body; // depends on Cliq payload
+  // default behavior: save to Notion as a page with the message text
+  const token = await getNotionTokenForCliqUser(user.id);
+  if (!token) return res.json({ text: 'Please connect Notion first.'});
+  const page = await notionService.createDocFromMessage(token.access_token, {
+    title: `Message from ${user.name}`,
+    content: message.content,
+    cliqLink: `https://cliq/.../${message.id}`
+  });
+  // respond to Cliq with confirmation (optionally ephemeral)
+  res.json({ text: `Saved to Notion: ${page.url}` });
+});
+```
+
+### Option: show a confirm modal
+
+If Cliq supports returning a modal payload, you can return a JSON modal that allows user to select DB/due/tags.
+
+---
+
+# 10 — Widget (embedded dashboard inside Cliq)
+
+## Purpose
+
+Show “My Tasks”, recent docs, quick search. Widget is an embeddable URL (iframe) served by your server.
+
+## Simple widget files (`cliq-widget/index.html`)
+
+```html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Notion Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 8px; }
+    .task { padding: 8px; border-bottom: 1px solid #ddd; }
+  </style>
+</head>
+<body>
+  <h3>My Tasks</h3>
+  <div id="tasks">Loading…</div>
+
+  <script>
+    async function fetchTasks(){
+      const resp = await fetch('/api/widget/my-tasks', { credentials: 'include' });
+      const data = await resp.json();
+      const container = document.getElementById('tasks');
+      if (!data || data.length === 0) container.innerHTML = '<i>No tasks found</i>';
+      else container.innerHTML = data.map(t => `<div class="task"><a href="${t.url}" target="_blank">${t.title}</a> — ${t.due||''}</div>`).join('');
+    }
+    fetchTasks();
+  </script>
+</body>
+</html>
+```
+
+## Backend endpoint for widget
+
+* `/api/widget/my-tasks` should find the logged-in Cliq user (via session or a token), fetch tasks from Notion via API (query the database) and return JSON.
+
+### Auth for embedded UI
+
+* For simple PoC, store a session cookie when the user connects Notion and use it for widget.
+* For production, implement JWT-based auth: the Cliq app can pass a signed token when loading the widget (if Cliq supports), or users can log in via the widget.
+
+---
+
+# 11 — Notion webhooks & notifying Cliq
+
+## Use-case
+
+When a Notion task page is updated (status changed or due date changed), Notion can POST webhook events to your server. Your backend inspects the webhook and then sends a message via Cliq APIs to the affected user (or posts to channel).
+
+## Steps
+
+1. Create webhook subscription in Notion via the API (if available). Notion’s webhook support might have specifics — check docs for creating subscriptions to database/page events.
+2. Provide a `POST /notion/webhook` endpoint that accepts events.
+3. On receiving an event, map `notion_page_id` → local mapping → find `cliq_user_id`. Post message using Cliq bot API or send a DM.
+
+## Example webhook handler skeleton
+
+```js
+router.post('/notion/webhook', async (req, res) => {
+  const event = req.body;
+  // validate signature if provided
+  for (const change of event.changes) {
+    const pageId = change.page_id;
+    const mapping = await db.findMappingByNotionPageId(pageId);
+    if (mapping) {
+      const user = await db.findUserById(mapping.user_id);
+      // call cliqService.postMessage(user.cliq_user_id, `Task updated: ...`);
+    }
+  }
+  res.status(200).send('ok');
+});
+```
+
+---
+
+# 12 — Scheduled reminders (cron job)
+
+Use `node-cron` to run a job every hour (or day) that:
+
+* Queries Notion for tasks with due date within `X` hours.
+* For each due task, finds associated Cliq user(s) and sends a reminder message.
+
+Example:
+
+```js
+const cron = require('node-cron');
+cron.schedule('0 * * * *', async () => { // every hour
+  // find upcoming tasks via Notion API (or query DB if you mirrored tasks)
+});
+```
+
+Alternative: use Notion webhooks for changes and schedule reminders per task creation.
+
+---
+
+# 13 — Security & production concerns
+
+Do this before deploy:
+
+* Store secrets in environment variables (`.env` for local, use cloud secret stores for prod).
+* Encrypt tokens in DB or use a secrets vault.
+* Validate incoming requests:
+
+  * For Cliq: verify request signature / token (Cliq provides verification mechanism).
+  * For Notion: verify webhook signature if provided.
+* Use HTTPS (ngrok for dev; use cloud hosting with certs in prod).
+* Rate limit outbound requests to Notion and implement retry/backoff.
+* Do not log access tokens or secrets.
+* Implement refresh token lifecycle (refresh when `expires_at` near).
+
+---
+
+# 14 — Testing & QA checklist
+
+Unit tests
+
+* Token exchange code.
+* Notion API calls mock responses.
+* Slash command parsing logic.
+
+Integration tests (manual)
+
+* OAuth flow end-to-end.
+* Slash command creates page in Notion and shows link.
+* Message action creates page and includes original message link.
+* Widget shows My Tasks.
+
+Edge cases
+
+* Token expired (refresh works).
+* Notion API errors (429, 500) — handle retries.
+* Cliq request signature invalid — reject.
+
+---
+
+# 15 — Deployment options
+
+Quick options:
+
+* Heroku: easy setup, free tier (deprecated?), good for PoC.
+* Render / Railway / Vercel (serverless) — use for small apps.
+* DigitalOcean App Platform / AWS / GCP for production.
+
+Deployment steps:
+
+1. Add environment variables in platform UI: `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `NOTION_REDIRECT_URI`, `NOTION_TASK_DB_ID`, `DATABASE_URL`, `CLIQ_VERIFY_TOKEN` etc.
+2. Deploy server and widget.
+3. Update Cliq app endpoints & Notion redirect URIs to your production domain.
+4. Run a small smoke test.
+
+---
+
+# 16 — Demo checklist & judge pitch (two-minute flow)
+
+Demo steps to show:
+
+1. Open Cliq, run `/notion connect` or click Connect in widget → show Notion OAuth flow.
+2. In a channel, type `/notion task add Finish slides --due 2025-12-01` → show confirmation in Cliq and show page created in Notion.
+3. Right-click a message → Save to Notion → open created Notion page.
+4. Open widget (Notion Dashboard) inside Cliq → show My Tasks listing and link to Notion pages.
+5. Simulate updating a Notion task status → show webhook triggers a Cliq message to assignee.
+6. Show reminders (or run job manually to send upcoming due reminders).
+
+Pitch bullets:
+
+* Problem: Context switching between docs and chat costs time and interrupts flow.
+* Solution: Create/save tasks and docs in Notion from Cliq, receive timely notifications and reminders, mini-dashboard inside Cliq.
+* Impact: Faster turn-around on action items, single source of truth, higher team productivity.
+* Ask: We want judges to test our live PoC and provide feedback.
+
+---
+
+# 17 — Troubleshooting & FAQ
+
+Q: Notion tokens fail with 401
+A: Token expired — implement refresh using `/oauth/token` with `grant_type=refresh_token`. Ensure you stored `refresh_token`.
+
+Q: Cliq not sending payloads to my localhost
+A: Use ngrok (`ngrok http 3000`) and put the ngrok HTTPS URL in Cliq app config.
+
+Q: How to get Notion DB id
+A: Open the database in Notion — the ID is in the URL (a UUID). Or query `search` API.
+
+Q: Notion API limits
+A: Avoid polling large endpoints. Use webhooks where possible.
+
+---
+
+# 18 — Next steps & feature roadmap (after MVP)
+
+* Two-way sync: show Notion edits in Cliq in real time (and optionally update Cliq cards).
+* Multi-user sharing: let a team connect a shared Notion integration.
+* Attachment support: upload files from Cliq to Notion.
+* Templates & recurring tasks.
+* Add support for Google Docs / Confluence.
+* Analytics: show task completion metrics in widget.
+
+---
+
+# 19 — Handy resources & links (bookmark)
+
+* Notion API docs — OAuth & pages/databases (search their dev docs).
+* Zoho Cliq developer docs — slash commands, message actions, widgets.
+* Axios docs, Node.js docs, Express docs.
+* ngrok docs for local dev.
+
+---
+
+# Environment variables you’ll need
+
+Add a `.env` (never commit to git):
+
+```
+PORT=3000
+NODE_ENV=development
+
+NOTION_CLIENT_ID=...
+NOTION_CLIENT_SECRET=...
+NOTION_REDIRECT_URI=https://<your-ngrok>.ngrok.io/auth/notion/callback
+NOTION_TASK_DB_ID=...
+
+CLIQ_VERIFY_TOKEN=...           # if Cliq provides
+CLIQ_APP_KEY=...                # optional
+DATABASE_URL=postgres://user:pass@localhost:5432/notion_cliq
+
+JWT_SECRET=some_long_random_secret
+```
+
+---
+
+# Ready-to-copy checklist (the exact next commands to run now)
+
+1. Create project folder, init git and node:
+
+```bash
+mkdir notion-cliq-integration && cd notion-cliq-integration
+git init
+npm init -y
+npm i express axios dotenv body-parser node-cron pg sequelize
+npm i --save-dev nodemon
+```
+
+2. Create minimal `src/index.js` to run server:
+
+```js
+require('dotenv').config();
+const express = require('express');
+const app = express();
+app.use(express.json());
+app.get('/', (req,res)=>res.send('Notion-Cliq bridge running'));
+app.listen(process.env.PORT || 3000, ()=> console.log('Server up'));
+```
+
+`npm run dev` to start.
+
+3. Install & run ngrok:
+
+```bash
+ngrok http 3000
+```
+
+Copy the HTTPS ngrok URL — you’ll use it in Notion redirect and Cliq webhook endpoints.
+
+4. Register Notion integration (use the ngrok redirect URI).
+5. Register Cliq app and set slash command endpoint to `https://<ngrok>/cliq/slash` and message action endpoint to `https://<ngrok>/cliq/message-action`.
+6. Implement OAuth endpoints `/auth/notion/start` and `/auth/notion/callback`.
+7. Implement `/cliq/slash` route to handle `/notion task add`.
+8. Test end-to-end.
+
+---
+
+# Final notes (motivational)
+
+You’ve picked a high-utility idea that’s doable and impresses judges because it’s practical and demonstrable. Start with the OAuth + slash command (that’s the shortest path to a working demo). Keep commits small and demoable. Save the hard syncing features for later.
+
+---
+
+If you want, I’ll **generate the full starter repository now** for you:
+
+* a working Express server with OAuth endpoints,
+* a `/cliq/slash` handler that creates a Notion page (with placeholder tokens),
+* `cliq-widget/index.html`,
+* and a README with setup steps.
+
+Which would you like me to create for you right now:
+A) Full starter repo (code + README) — ready to paste into files, or
+B) Detailed implementation of a single piece (pick one): OAuth flow / Slash command / Message action / Widget / Webhook handler?
